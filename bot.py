@@ -111,7 +111,7 @@ def post_news():
 def main():
     # Har 10 minute me news
     schedule.every(10).minutes.do(post_news)
-    # Test karne ke liye upar wali line comment karke neeche wali use kar sakte ho:
+    # Test ke liye:
     # schedule.every(1).minutes.do(post_news)
 
     print("🤖 Auto News Bot 24/7 mode me chal raha hai (Render pe)...")
