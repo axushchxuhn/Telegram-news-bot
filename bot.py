@@ -3,35 +3,26 @@ import time
 import requests
 import feedparser
 import schedule
-from telegram import Bot
 
-# ====== CONFIG (ENVIRONMENT VARIABLES SE LE RAHE HAIN) =======
+# ====== CONFIG (ENVIRONMENT VARIABLES) =======
 
-# In values ko code me nahi, Railway me "Variables" me set karoge:
-# BOT_TOKEN  -> BotFather se
-# CHANNEL_ID -> @chxuhan
-# AI_KEY     -> OpenAI API key
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHANNEL_ID = os.environ.get("CHANNEL_ID")
-AI_KEY = os.environ.get("AI_KEY")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")   # Render me set karoge
+CHANNEL_ID = os.environ.get("CHANNEL_ID") # @chxuhan
+AI_KEY = os.environ.get("AI_KEY")         # OpenAI API key
 
 if not BOT_TOKEN or not CHANNEL_ID or not AI_KEY:
-    raise ValueError(
-        "BOT_TOKEN, CHANNEL_ID, AI_KEY me se koi missing hai. "
-        "Railway ke Variables me teeno set karo."
-    )
+    raise ValueError("BOT_TOKEN, CHANNEL_ID, AI_KEY environment variables set karo.")
 
-bot = Bot(token=BOT_TOKEN)
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # ====== NEWS SOURCES (WORLDWIDE) =======
 RSS_LINKS = [
     "https://news.google.com/news/rss?hl=en-IN&gl=IN&ceid=IN:en",
     "http://feeds.bbci.co.uk/news/world/rss.xml",
-    "https://www.reutersagency.com/feed/?best-topics=world&post_type=best"
+    "https://www.reutersagency.com/feed/?best-topics=world&post_type=best",
 ]
 
-# ========== AI SUMMARY (OpenAI API via requests) ==========
+# ========== AI SUMMARY (OpenAI API) ==========
 def summarize(text: str) -> str:
     url = "https://api.openai.com/v1/chat/completions"
 
@@ -67,18 +58,31 @@ def summarize(text: str) -> str:
         return "News summarize karte waqt error aaya 😅"
 
 
+# ========== TELEGRAM SEND MESSAGE ==========
+def send_message(text: str):
+    try:
+        payload = {
+            "chat_id": CHANNEL_ID,
+            "text": text,
+            "parse_mode": "Markdown",
+        }
+        r = requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload, timeout=20)
+        r.raise_for_status()
+        print("✅ Message sent to channel")
+    except Exception as e:
+        print("❌ Error sending message:", e)
+
+
 # ========== FETCH NEWS ==========
 def get_latest_news():
     all_news = []
 
     for link in RSS_LINKS:
         feed = feedparser.parse(link)
-        # har source se top 3
-        for entry in feed.entries[:3]:
+        for entry in feed.entries[:3]:  # har source se 3
             all_news.append(f"{entry.title} - {entry.link}")
 
-    # total 3 hi lenge, 10–10 min me bahut spam na ho
-    return all_news[:3]
+    return all_news[:3]  # total 3 hi lenge
 
 
 # ========== POST NEWS TO CHANNEL ==========
@@ -94,9 +98,8 @@ def post_news():
             try:
                 short = summarize(news)
                 post = f"🌍 *World Update*\n\n{short}"
-                bot.send_message(chat_id=CHANNEL_ID, text=post, parse_mode="Markdown")
-                print("✅ Post ki gayi:", short[:80])
-                time.sleep(5)  # messages ke beech thoda gap
+                send_message(post)
+                time.sleep(5)
             except Exception as e:
                 print("❌ Ek news post karte time error:", e)
                 time.sleep(2)
@@ -106,10 +109,12 @@ def post_news():
 
 
 def main():
-    # ====== SCHEDULE: HAR 10 MINUTE ME =========
+    # Har 10 minute me news
     schedule.every(10).minutes.do(post_news)
+    # Test karne ke liye upar wali line comment karke neeche wali use kar sakte ho:
+    # schedule.every(1).minutes.do(post_news)
 
-    print("🤖 Auto News Bot 24/7 mode me chal raha hai (Railway pe)...")
+    print("🤖 Auto News Bot 24/7 mode me chal raha hai (Render pe)...")
     while True:
         schedule.run_pending()
         time.sleep(1)
