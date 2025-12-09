@@ -1,13 +1,16 @@
 import os
 import time
+import threading
+
 import requests
 import feedparser
 import schedule
+from flask import Flask
 
 # ====== CONFIG (ENVIRONMENT VARIABLES) =======
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")   # Render me set karoge
-CHANNEL_ID = os.environ.get("CHANNEL_ID") # @chxuhan
+BOT_TOKEN = os.environ.get("BOT_TOKEN")   # Render Environment me set karo
+CHANNEL_ID = os.environ.get("CHANNEL_ID") # e.g. @chxuhan
 AI_KEY = os.environ.get("AI_KEY")         # OpenAI API key
 
 if not BOT_TOKEN or not CHANNEL_ID or not AI_KEY:
@@ -108,17 +111,38 @@ def post_news():
         print("❌ post_news top-level error:", e)
 
 
-def main():
-    # Har 10 minute me news
+# ========== SCHEDULER THREAD ==========
+def run_scheduler():
+    # Har 10 minutes me news
     schedule.every(10).minutes.do(post_news)
-    # Test ke liye:
+    # Test ke liye 1 minute:
     # schedule.every(1).minutes.do(post_news)
 
-    print("🤖 Auto News Bot 24/7 mode me chal raha hai (Render pe)...")
+    print("🕒 Scheduler thread start ho gaya...")
     while True:
         schedule.run_pending()
         time.sleep(1)
 
 
+# ========== FLASK APP (PORT ke liye, Render ko khush rakhne ke liye) ==========
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "Telegram News Bot is running ✅"
+
+
+def main():
+    # Scheduler ko background thread me chalao
+    t = threading.Thread(target=run_scheduler, daemon=True)
+    t.start()
+
+    # Flask app ko Render ke PORT par start karo
+    port = int(os.environ.get("PORT", 10000))
+    print(f"🌐 Flask web server starting on port {port}...")
+    app.run(host="0.0.0.0", port=port)
+
+
 if __name__ == "__main__":
+    print("🤖 Auto News Bot 24/7 (Render Web Service) start ho raha hai...")
     main()
