@@ -38,7 +38,7 @@ sent_ids = set()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 request = Request(con_pool_size=8)
-bot = Bot(token=TELEGRAM_TOKEN, request=request)
+bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)
 
 app = Flask(__name__)
 
