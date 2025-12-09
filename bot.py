@@ -17,13 +17,12 @@ from telegram.utils.request import Request
 
 
 # ------------ ENVIRONMENT CONFIG ------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")    # Example: -1001234567890
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
-if not TELEGRAM_TOKEN or not CHANNEL_ID or not OPENAI_API_KEY:
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
     raise RuntimeError(
-        "Missing environment variables! TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, OPENAI_API_KEY set karo."
+        "Missing environment variables! TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID set karo."
     )
 
 # ------------ GLOBAL SETTINGS ------------
