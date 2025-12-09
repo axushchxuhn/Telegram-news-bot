@@ -17,25 +17,33 @@ from telegram.utils.request import Request
 
 
 # ------------ ENVIRONMENT CONFIG ------------
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID or not OPENAI_API_KEY:
     raise RuntimeError(
-        "Missing environment variables! TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID set karo."
+        "Missing environment variables! TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, OPENAI_API_KEY set karo."
     )
 
+
 # ------------ GLOBAL SETTINGS ------------
+
 RSS_LINKS = [
     "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en",
     "https://feeds.reuters.com/reuters/worldNews",
     "https://feeds.bbci.co.uk/news/world/rss.xml",
 ]
 
-NEWS_PER_RUN = 3
+# Ab har run me max 5 news
+NEWS_PER_RUN = 5
 sent_ids = set()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
 request = Request(con_pool_size=8)
 bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)
@@ -44,18 +52,24 @@ app = Flask(__name__)
 
 
 # ------------ URL SHORTENER ------------
-def short_url(url):
+
+def short_url(url: str) -> str:
     try:
-        r = requests.get("https://tinyurl.com/api-create.php", params={"url": url}, timeout=10)
+        r = requests.get(
+            "https://tinyurl.com/api-create.php",
+            params={"url": url},
+            timeout=10,
+        )
         if r.status_code == 200:
             return r.text.strip()
         return url
-    except:
+    except Exception:
         return url
 
 
 # ------------ AI SUMMARY + HINDI VOICE TEXT ------------
-def ai_summarize(title, description, link):
+
+def ai_summarize(title: str, description: str, link: str):
     system_prompt = """
 Tum ek professional news assistant ho.
 
@@ -83,15 +97,18 @@ Rules:
             {"role": "user", "content": user_text},
         ],
         "max_tokens": 200,
-        "temperature": 0.7
+        "temperature": 0.7,
     }
 
     try:
         res = requests.post(
             "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
             json=payload,
-            timeout=30
+            timeout=30,
         )
 
         data = res.json()
@@ -101,7 +118,7 @@ Rules:
         return (
             obj.get("summary_en", ""),
             obj.get("voice_hi", ""),
-            obj.get("hashtags", "#WorldNews #Breaking #Update")
+            obj.get("hashtags", "#WorldNews #Breaking #Update"),
         )
 
     except Exception as e:
@@ -110,8 +127,9 @@ Rules:
 
 
 # ------------ HINDI AUDIO ------------
-def make_voice(text):
-    if not text.strip():
+
+def make_voice(text: str):
+    if not text or not text.strip():
         return None
 
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
@@ -121,11 +139,12 @@ def make_voice(text):
         tts = gTTS(text=text, lang="hi")
         tts.save(temp.name)
         return temp.name
-    except:
+    except Exception:
         return None
 
 
 # ------------ FETCH LATEST NEWS ------------
+
 def fetch_news():
     entries = []
 
@@ -135,19 +154,24 @@ def fetch_news():
             for e in feed.entries[:5]:
                 eid = getattr(e, "id", None) or getattr(e, "link", None)
                 if eid:
-                    entries.append({
-                        "id": eid,
-                        "title": getattr(e, "title", ""),
-                        "link": getattr(e, "link", ""),
-                        "summary": getattr(e, "summary", "") or getattr(e, "description", "")
-                    })
-        except:
+                    entries.append(
+                        {
+                            "id": eid,
+                            "title": getattr(e, "title", ""),
+                            "link": getattr(e, "link", ""),
+                            "summary": getattr(e, "summary", "")
+                            or getattr(e, "description", ""),
+                        }
+                    )
+        except Exception:
             pass
 
+    # Latest news ko end se start karne ke liye reverse
     return entries[::-1]
 
 
 # ------------ PREMIUM FORMAT MESSAGE ------------
+
 def format_message(title, summary_en, link, hashtags):
     safe_title = html.escape(title)
     safe_summary = html.escape(summary_en)
@@ -160,19 +184,51 @@ def format_message(title, summary_en, link, hashtags):
     short = short_url(link)
 
     msg = (
-        f"🚨 <b>International Breaking News</b>\n"
+        "🚨 <b>International Breaking News</b>\n"
         f"📅 <i>{time_str}</i>\n\n"
         f"📰 <b>{safe_title}</b>\n\n"
         f"{safe_summary}\n\n"
         f"🔗 Full Story: <a href=\"{short}\">Read here</a>\n\n"
         f"{safe_tags}\n"
-        f"<i>Powered by @Axshchxhan</i>"
+        "<i>Powered by @Axshchxhan</i>"
     )
 
     return msg
 
 
+# ------------ STARTUP DEMO MESSAGE ------------
+
+def send_startup_demo():
+    """Bot jab bhi restart / deploy hoke live hoga,
+    tab ek hi baar demo news bhejega."""
+    try:
+        ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        time_str = ist.strftime("%d %b %Y | %I:%M %p IST")
+
+        text = (
+            "🟢 <b>Ayush Telegram News Bot Updated</b>\n"
+            f"📅 <i>{time_str}</i>\n\n"
+            "📰 Demo Update:\n"
+            "Bot successfully restart ho chuka hai. "
+            "Ab se har 15 minute me latest international breaking news, "
+            "English summary + Hindi audio ke saath milegi.\n\n"
+            "#WorldNews #Breaking #Update\n"
+            "<i>Powered by @Axshchxhan</i>"
+        )
+
+        bot.send_message(
+            chat_id=TELEGRAM_CHANNEL_ID,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        logging.info("Startup demo message sent.")
+    except Exception as e:
+        logging.error(f"Startup demo send failed: {e}")
+
+
 # ------------ MAIN POSTING JOB ------------
+
 def post_news():
     logging.info("Checking for new news...")
     entries = fetch_news()
@@ -199,10 +255,10 @@ def post_news():
 
         # Send text news
         bot.send_message(
-            chat_id=CHANNEL_ID,
+            chat_id=TELEGRAM_CHANNEL_ID,
             text=msg_text,
             parse_mode="HTML",
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
         )
 
         # Send Hindi voice
@@ -211,9 +267,9 @@ def post_news():
             if audio_path:
                 with open(audio_path, "rb") as f:
                     bot.send_audio(
-                        chat_id=CHANNEL_ID,
+                        chat_id=TELEGRAM_CHANNEL_ID,
                         audio=f,
-                        caption="🎙 हिंदी ऑडियो न्यूज़"
+                        caption="🎙 हिंदी ऑडियो न्यूज़",
                     )
                 os.remove(audio_path)
 
@@ -237,13 +293,15 @@ def home():
 
 def main():
     logging.info("🔥 Ayush Telegram News Bot Started!")
-    schedule.every(10).minutes.do(post_news)
 
-    # Run first time instantly
-    try:
-        post_news()
-    except:
-        pass
+    # 1) STARTUP DEMO – sirf ek baar jab process start hota hai
+    send_startup_demo()
+
+    # 2) Ab se har 15 minute me 5 news tak
+    schedule.every(15).minutes.do(post_news)
+
+    # Yaha ab immediate post_news() nahi call kar rahe,
+    # taaki startup pe sirf demo message hi aaye.
 
     t = Thread(target=scheduler_loop, daemon=True)
     t.start()
