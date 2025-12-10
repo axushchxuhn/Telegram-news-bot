@@ -3,87 +3,91 @@ import time
 import json
 import html
 import logging
-import tempfile
 from datetime import datetime, timedelta
 from threading import Thread
-from difflib import SequenceMatcher
 
 import feedparser
 import schedule
 import requests
-from flask import Flask, request
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from flask import Flask, request as flask_request
+from telegram import (
+    Bot,
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.utils.request import Request
 
+# ------------ BASIC LOGGING ------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
-# ============= ENVIRONMENT CONFIG =============
-
+# ------------ ENVIRONMENT CONFIG ------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # optional
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")    # optional (DM alerts)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-SAFE_MODE = os.getenv("SAFE_MODE", "0").lower() in ("1", "true", "yes")
+ADMIN_USER_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL_ID!")
+    raise RuntimeError(
+        "Missing environment variables! TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID set karo."
+    )
 
+# Admin IDs set (comma separated integers)
+if ADMIN_USER_IDS_RAW:
+    ADMIN_USER_IDS = {
+        int(x.strip()) for x in ADMIN_USER_IDS_RAW.split(",") if x.strip()
+    }
+    logging.info(f"Admin lock enabled, admins: {ADMIN_USER_IDS}")
+else:
+    ADMIN_USER_IDS = set()
+    logging.warning(
+        "ADMIN_USER_IDS set nahi hai. Sab users ko admin maana jayega (dev mode)."
+    )
 
-# ============= GLOBAL SETTINGS =============
-
-WORLD_RSS = [
+# ------------ GLOBAL SETTINGS ------------
+RSS_LINKS = [
     "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en",
     "https://feeds.reuters.com/reuters/worldNews",
     "https://feeds.bbci.co.uk/news/world/rss.xml",
 ]
 
-INDIA_RSS = [
-    "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:hi",
-]
+NEWS_PER_RUN = 5            # 15 minutes me 5 news
+AUTO_NEWS_ENABLED = True    # control panel se on/off hoga
 
-NEWS_PER_RUN = 5               # max news per cycle
-SUMMARY_MAX_CHARS = 260        # summary length limit
+sent_ids = set()            # duplicate block ke liye
+LAST_POST_TIME = None
+POSTS_TODAY = 0
+DUPLICATE_SKIPPED = 0
 
-sent_ids = set()               # avoid exact duplicates
-sent_titles = []               # for similarity-based duplicate block
-recent_posts = []              # for summaries
-
-last_run_time = None
-last_run_count = 0
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-
-request_obj = Request(con_pool_size=8)
-bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request_obj)
+request = Request(con_pool_size=8)
+bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)
 app = Flask(__name__)
 
 
-# ============= ADMIN ALERTS =============
-
-def send_admin_alert(message: str):
-    if not ADMIN_CHAT_ID:
-        return
-    try:
-        bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=f"⚠ <b>News Bot Alert</b>\n{html.escape(message)}",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logging.error(f"Failed to send admin alert: {e}")
+# ------------ HELPER: TIME + ADMIN CHECK ------------
+def now_ist():
+    """UTC + 5:30"""
+    return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
 
-# ============= URL SHORTENER =============
+def is_admin(user_id: int) -> bool:
+    if not ADMIN_USER_IDS:
+        # agar list khali hai to sab admin (dev mode)
+        return True
+    return user_id in ADMIN_USER_IDS
 
+
+# ------------ URL SHORTENER ------------
 def short_url(url: str) -> str:
     try:
         r = requests.get(
             "https://tinyurl.com/api-create.php",
             params={"url": url},
-            timeout=10
+            timeout=10,
         )
         if r.status_code == 200:
             return r.text.strip()
@@ -92,28 +96,25 @@ def short_url(url: str) -> str:
         return url
 
 
-# ============= TEXT LIMIT HELPER =============
-
-def limit_text(text: str, max_chars: int) -> str:
-    text = text.strip()
-    if len(text) <= max_chars:
-        return text
-    cut = text[:max_chars]
-    if " " in cut:
-        cut = cut.rsplit(" ", 1)[0]
-    return cut + "..."
-
-
-# ============= AI SUMMARY (TEXT ONLY) =============
-
+# ------------ AI / SIMPLE SUMMARY ------------
 def ai_summarize(title: str, description: str, link: str):
     """
-    Sirf English summary + AI hashtags.
-    Agar OPENAI_API_KEY nahi hai ya error aata hai to (None, None) return karega.
+    Agar OPENAI_API_KEY hai -> smart AI summary.
+    Agar nahi hai -> simple fallback summary.
     """
+    # Fallback simple mode
     if not OPENAI_API_KEY:
-        return None, None
+        # Simple English summary (title + thoda desc)
+        short_desc = (description or "").strip()
+        if len(short_desc) > 200:
+            short_desc = short_desc[:197] + "..."
 
+        summary_en = f"{title}\n\n{short_desc}".strip()
+        voice_hi = ""  # audio system band, to kuch nahi
+        hashtags = "#WorldNews #Breaking #Update"
+        return summary_en, voice_hi, hashtags
+
+    # --- AI mode ---
     system_prompt = """
 Tum ek professional news assistant ho.
 
@@ -121,11 +122,13 @@ Har news ke liye SIRF yeh JSON return karo:
 
 {
   "summary_en": "...",
+  "voice_hi": "...",
   "hashtags": "..."
 }
 
 Rules:
 - summary_en: 2-3 short simple English lines.
+- voice_hi: Hindi me 1-2 lines, jaise news anchor bolta hai.
 - hashtags: exactly 3-4 tags (one line).
 - JSON ke bahar kuch mat likho.
 """
@@ -138,7 +141,7 @@ Rules:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ],
-        "max_tokens": 160,
+        "max_tokens": 200,
         "temperature": 0.7,
     }
 
@@ -152,501 +155,387 @@ Rules:
             json=payload,
             timeout=30,
         )
-
         data = res.json()
         raw = data["choices"][0]["message"]["content"]
         obj = json.loads(raw)
 
         return (
             obj.get("summary_en", ""),
+            obj.get("voice_hi", ""),
             obj.get("hashtags", "#WorldNews #Breaking #Update"),
         )
 
     except Exception as e:
         logging.error(f"AI Error: {e}")
-        send_admin_alert(f"AI summary failed: {e}")
-        return None, None
+        # fallback simple
+        short_desc = (description or "").strip()
+        if len(short_desc) > 200:
+            short_desc = short_desc[:197] + "..."
+        summary_en = f"{title}\n\n{short_desc}".strip()
+        return summary_en, "", "#WorldNews #Breaking #Update"
 
 
-# ============= TOPIC/CATEGORY DETECTION =============
-
-def detect_category(text: str) -> str:
-    t = text.lower()
-    if any(w in t for w in ["stock", "market", "share", "crypto", "bitcoin", "sensex", "nifty"]):
-        return "FINANCE"
-    if any(w in t for w in ["technology", "tech", "ai ", "artificial intelligence", "app", "startup"]):
-        return "TECH"
-    if any(w in t for w in ["parliament", "election", "minister", "government", "modi", "bjp", "congress"]):
-        return "POLITICS"
-    if any(w in t for w in ["war", "attack", "missile", "gaza", "ukraine", "russia", "israel", "palestine"]):
-        return "CONFLICT"
-    return "GENERAL"
-
-
-def topic_hashtags(title: str, summary: str, base_tags: str | None) -> str:
-    text = (title + " " + summary).lower()
-    tags = set()
-
-    if base_tags:
-        for t in base_tags.split():
-            if t.startswith("#"):
-                tags.add(t)
-
-    # India
-    if any(w in text for w in ["india", "delhi", "mumbai", "kolkata", "bangalore", "modi"]):
-        tags.update(["#India", "#Politics"])
-
-    # USA
-    if any(w in text for w in ["usa", "us ", "biden", "trump", "white house"]):
-        tags.update(["#USA", "#Politics"])
-
-    # Finance
-    if any(w in text for w in ["stock", "market", "share", "crypto", "bitcoin", "sensex", "nifty"]):
-        tags.update(["#Finance", "#Economy"])
-
-    # Tech
-    if any(w in text for w in ["technology", "tech", "ai ", "artificial intelligence", "app", "startup"]):
-        tags.update(["#Technology", "#Innovation"])
-
-    # Conflict
-    if any(w in text for w in ["war", "attack", "missile", "gaza", "ukraine", "russia", "israel", "palestine"]):
-        tags.update(["#Conflict", "#GlobalCrisis"])
-
-    tags.add("#WorldNews")
-    tags.add("#Breaking")
-
-    final = list(tags)[:6]
-    return " ".join(final)
-
-
-# ============= DUPLICATE (SIMILARITY) CHECK =============
-
-def is_similar_title(new_title: str, threshold: float = 0.9) -> bool:
-    new_title_clean = new_title.lower().strip()
-    for old in sent_titles:
-        ratio = SequenceMatcher(None, old, new_title_clean).ratio()
-        if ratio >= threshold:
-            return True
-    return False
-
-
-# ============= IMAGE EXTRACTION =============
-
-def extract_image_from_entry(e) -> str | None:
-    try:
-        media_content = getattr(e, "media_content", None)
-        if media_content and len(media_content) > 0:
-            url = media_content[0].get("url")
-            if url:
-                return url
-    except Exception:
-        pass
-
-    try:
-        media_thumb = getattr(e, "media_thumbnail", None)
-        if media_thumb and len(media_thumb) > 0:
-            url = media_thumb[0].get("url")
-            if url:
-                return url
-    except Exception:
-        pass
-
-    try:
-        for link in getattr(e, "links", []):
-            if link.get("type", "").startswith("image/"):
-                return link.get("href")
-    except Exception:
-        pass
-
-    return None
-
-
-# ============= FETCH NEWS (INDIA + WORLD + IMAGE) =============
-
+# ------------ FETCH LATEST NEWS (WITH IMAGE TRY) ------------
 def fetch_news():
     entries = []
 
-    # World news
-    for url in WORLD_RSS:
+    for url in RSS_LINKS:
         try:
             feed = feedparser.parse(url)
-            for e in feed.entries[:5]:
+            for e in feed.entries[:8]:
                 eid = getattr(e, "id", None) or getattr(e, "link", None)
-                if not eid or eid in sent_ids:
+                if not eid:
                     continue
+
+                summary = getattr(e, "summary", "") or getattr(
+                    e, "description", ""
+                )
+
+                # try to find image
+                img_url = None
+                try:
+                    if hasattr(e, "media_content"):
+                        mc = e.media_content
+                        if mc and isinstance(mc, list) and mc[0].get("url"):
+                            img_url = mc[0]["url"]
+                except Exception:
+                    img_url = None
+
+                if not img_url:
+                    try:
+                        for l in getattr(e, "links", []):
+                            if l.get("type", "").startswith("image/"):
+                                img_url = l.get("href")
+                                break
+                    except Exception:
+                        img_url = None
 
                 entries.append(
                     {
                         "id": eid,
                         "title": getattr(e, "title", ""),
                         "link": getattr(e, "link", ""),
-                        "summary": getattr(e, "summary", "") or getattr(e, "description", ""),
-                        "region": "WORLD",
-                        "image": extract_image_from_entry(e),
+                        "summary": summary,
+                        "image": img_url,
                     }
                 )
-        except Exception as ex:
-            logging.error(f"World RSS fetch error from {url}: {ex}")
-            send_admin_alert(f"World RSS error: {ex}")
+        except Exception:
+            pass
 
-    # India news
-    for url in INDIA_RSS:
-        try:
-            feed = feedparser.parse(url)
-            for e in feed.entries[:5]:
-                eid = getattr(e, "id", None) or getattr(e, "link", None)
-                if not eid or eid in sent_ids:
-                    continue
-
-                entries.append(
-                    {
-                        "id": eid,
-                        "title": getattr(e, "title", ""),
-                        "link": getattr(e, "link", ""),
-                        "summary": getattr(e, "summary", "") or getattr(e, "description", ""),
-                        "region": "INDIA",
-                        "image": extract_image_from_entry(e),
-                    }
-                )
-        except Exception as ex:
-            logging.error(f"India RSS fetch error from {url}: {ex}")
-            send_admin_alert(f"India RSS error: {ex}")
-
+    # latest pehle aaye isliye reverse
     return entries[::-1]
 
 
-# ============= PREMIUM MESSAGE FORMAT =============
-
-def format_message(region: str, category: str, title: str, summary_en: str, link: str, hashtags: str) -> str:
+# ------------ PREMIUM FORMAT MESSAGE ------------
+def format_message(title, summary_en, link, hashtags):
     safe_title = html.escape(title)
     safe_summary = html.escape(summary_en)
     safe_tags = html.escape(hashtags)
 
-    ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    time_str = ist.strftime("%d %b %Y | %I:%M %p IST")
-
+    ist_time = now_ist().strftime("%d %b %Y | %I:%M %p IST")
     short = short_url(link)
 
-    region_tag = "🇮🇳 INDIA" if region == "INDIA" else "🌍 WORLD"
-    cat_emoji = {
-        "FINANCE": "💰 Finance",
-        "TECH": "💻 Tech",
-        "POLITICS": "🏛 Politics",
-        "CONFLICT": "⚔ Conflict",
-        "GENERAL": "📰 General",
-    }.get(category, "📰 General")
-
-    header_tag = f"[{region_tag} | {cat_emoji}]"
-
     msg = (
-        f"🌍 <b>International Breaking News</b> {header_tag}\n"
-        f"📅 <i>{time_str}</i>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🚨 <b>International Breaking News</b>\n"
+        f"📅 <i>{ist_time}</i>\n\n"
         f"📰 <b>{safe_title}</b>\n\n"
         f"{safe_summary}\n\n"
         f"🔗 Full Story: <a href=\"{short}\">Read here</a>\n\n"
         f"{safe_tags}\n"
-        "Powered by <i>@Axshchxhan</i>"
+        f"<i>Powered by @Axshchxhan</i>"
     )
 
     return msg
 
 
-def build_keyboard(short_link: str):
-    buttons = [
-        [InlineKeyboardButton("🌐 Full Story", url=short_link)],
-        [InlineKeyboardButton("📢 Join Updates Channel", url="https://t.me/chxuhan")],
-    ]
-    return InlineKeyboardMarkup(buttons)
+# ------------ MAIN POSTING JOB ------------
+def post_news(force: bool = False, max_items: int | None = None):
+    global LAST_POST_TIME, POSTS_TODAY, DUPLICATE_SKIPPED
 
-
-# ============= MAIN POSTING JOB =============
-
-def post_news():
-    global last_run_time, last_run_count
+    if not force and not AUTO_NEWS_ENABLED:
+        logging.info("Auto news disabled, skipping scheduled run.")
+        return
 
     logging.info("Checking for new news...")
     entries = fetch_news()
 
+    if max_items is None:
+        limit = NEWS_PER_RUN
+    else:
+        limit = max_items
+
     count = 0
-    try:
-        for e in entries:
-            if count >= NEWS_PER_RUN:
-                break
+    today_date = now_ist().date()
 
-            news_id = e["id"]
-            title = e["title"]
-            link = e["link"]
-            desc = e["summary"]
-            region = e["region"]
-            image_url = e["image"]
+    for e in entries:
+        if count >= limit:
+            break
 
-            if news_id in sent_ids:
-                continue
+        if e["id"] in sent_ids:
+            DUPLICATE_SKIPPED += 1
+            continue
 
-            if is_similar_title(title):
-                logging.info(f"Skipping similar title: {title}")
-                sent_ids.add(news_id)
-                continue
+        title = e["title"]
+        link = e["link"]
+        desc = e["summary"]
+        img = e["image"]
 
-            full_text = (title + " " + desc).strip()
-            category = detect_category(full_text)
+        summary_en, voice_hi, hashtags = ai_summarize(title, desc, link)
 
-            summary_en, ai_tags = ai_summarize(title, desc, link)
-            if not summary_en:
-                summary_en = (html.unescape(desc) or title).strip()
-                if not summary_en:
-                    summary_en = title
-                summary_en = limit_text(summary_en, SUMMARY_MAX_CHARS)
-                ai_tags = ""
+        if not summary_en:
+            sent_ids.add(e["id"])
+            continue
+
+        msg_text = format_message(title, summary_en, link, hashtags)
+
+        try:
+            if img:
+                bot.send_photo(
+                    chat_id=TELEGRAM_CHANNEL_ID,
+                    photo=img,
+                    caption=msg_text,
+                    parse_mode="HTML",
+                )
             else:
-                summary_en = limit_text(summary_en, SUMMARY_MAX_CHARS)
+                bot.send_message(
+                    chat_id=TELEGRAM_CHANNEL_ID,
+                    text=msg_text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
 
-            all_tags = topic_hashtags(title, summary_en, ai_tags)
-
-            msg_text = format_message(region, category, title, summary_en, link, all_tags)
-            short = short_url(link)
-            keyboard = build_keyboard(short)
-
-            # Photo first (if available)
-            if image_url:
-                try:
-                    bot.send_photo(
-                        chat_id=TELEGRAM_CHANNEL_ID,
-                        photo=image_url,
-                        caption=f"📰 {title}",
-                        parse_mode="HTML",
-                    )
-                except Exception as ex:
-                    logging.error(f"Image send error: {ex}")
-
-            # Then text message
-            bot.send_message(
-                chat_id=TELEGRAM_CHANNEL_ID,
-                text=msg_text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-                reply_markup=keyboard,
-            )
-
-            sent_ids.add(news_id)
-            sent_titles.append(title.lower().strip())
-            recent_posts.append({
-                "time": datetime.utcnow(),
-                "region": region,
-                "category": category,
-                "title": title,
-                "link": link,
-            })
-
+            sent_ids.add(e["id"])
             count += 1
+            LAST_POST_TIME = now_ist()
+            if LAST_POST_TIME.date() == today_date:
+                POSTS_TODAY += 1
+
             time.sleep(2)
-
-        last_run_time = datetime.utcnow()
-        last_run_count = count
-        logging.info(f"Posted {count} news this run.")
-
-    except Exception as e:
-        logging.error(f"post_news failed: {e}")
-        send_admin_alert(f"post_news failed: {e}")
+        except Exception as e:
+            logging.error(f"Send error: {e}")
+            sent_ids.add(e["id"])
+            continue
 
 
-# ============= DAILY SUMMARY (MORNING / NIGHT) =============
+# ------------ STATUS TEXT ------------
+def build_status_text():
+    ist_now = now_ist()
+    auto_state = "ON ✅" if AUTO_NEWS_ENABLED else "OFF ⏸"
 
-def build_daily_summary(title_prefix: str):
-    if not recent_posts:
-        return "No news collected yet."
-
-    last_items = recent_posts[-10:]
-    lines = []
-    for i, item in enumerate(reversed(last_items), start=1):
-        flag = "🇮🇳" if item["region"] == "INDIA" else "🌍"
-        cat = item.get("category", "GENERAL")
-        cat_emoji = {
-            "FINANCE": "💰",
-            "TECH": "💻",
-            "POLITICS": "🏛",
-            "CONFLICT": "⚔",
-            "GENERAL": "📰",
-        }.get(cat, "📰")
-        lines.append(f"{i}. {flag} {cat_emoji} {item['title']}")
-
-    body = "\n".join(lines)
-
-    ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    time_str = ist.strftime("%d %b %Y | %I:%M %p IST")
-
+    last_time = LAST_POST_TIME.strftime("%d %b %Y | %I:%M %p IST") if LAST_POST_TIME else "N/A"
     text = (
-        f"{title_prefix}\n"
-        f"🗓 <i>{time_str}</i>\n\n"
-        f"{body}\n\n"
-        "Stay tuned on this channel for live updates.\n"
+        "<b>🤖 Ayush News Bot Status</b>\n\n"
+        f"⏱ Time (IST): <code>{ist_now.strftime('%d %b %Y | %I:%M:%S %p')}</code>\n"
+        f"⚙ Auto News: <b>{auto_state}</b>\n"
+        f"📰 Posts Today: <b>{POSTS_TODAY}</b>\n"
+        f"🚫 Duplicates Blocked: <b>{DUPLICATE_SKIPPED}</b>\n"
+        f"🕒 Last Post: <i>{last_time}</i>\n"
+    )
+    return text
+
+
+# ------------ CONTROL PANEL ------------
+def send_control_panel(chat_id: int):
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 Status", callback_data="panel_status"),
+            InlineKeyboardButton("📰 1 News Now", callback_data="panel_news1"),
+        ],
+        [
+            InlineKeyboardButton("▶️ Auto ON/OFF", callback_data="panel_toggle"),
+        ],
+        [
+            InlineKeyboardButton("🧹 Refresh Cache", callback_data="panel_refresh"),
+            InlineKeyboardButton("🧪 Test Message", callback_data="panel_test"),
+        ],
+    ]
+    markup = InlineKeyboardMarkup(keyboard)
+    bot.send_message(
+        chat_id=chat_id,
+        text="🛠 <b>Ayush News Bot Control Panel</b>",
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
+
+# ------------ DEMO MESSAGE (restart / test) ------------
+def send_demo_update(chat_id: int | str):
+    ist_time = now_ist().strftime("%d %b %Y | %I:%M %p IST")
+    text = (
+        "🟢 <b>Ayush News Bot Updated</b>\n"
+        f"🗓 <i>{ist_time}</i>\n\n"
+        "Demo: Bot safaltapurvak chaalu ho chuka hai.\n"
+        "Ab har 15 minute me latest international news + image milegi.\n\n"
+        "#Update #LiveBot\n"
         "Powered by @Axshchxhan"
     )
-    return text
-
-
-def morning_summary():
-    text = build_daily_summary("🌅 <b>Morning Top Headlines</b>")
     bot.send_message(
-        chat_id=TELEGRAM_CHANNEL_ID,
+        chat_id=chat_id,
         text=text,
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
 
 
-def night_summary():
-    text = build_daily_summary("🌙 <b>Night Wrap-up</b>")
-    bot.send_message(
-        chat_id=TELEGRAM_CHANNEL_ID,
-        text=text,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-
-
-# ============= DAILY POLL =============
-
-def daily_poll():
+# ------------ TELEGRAM UPDATE HANDLER ------------
+def handle_update(update: Update):
     try:
-        question = "Aapko kaunsi news category sabse zyada pasand hai?"
-        options = ["🌍 World", "🇮🇳 India", "💰 Finance", "💻 Tech", "Mix sab"]
-        bot.send_poll(
-            chat_id=TELEGRAM_CHANNEL_ID,
-            question=question,
-            options=options,
-            is_anonymous=True,
-            allows_multiple_answers=False,
-        )
+        if update.callback_query:
+            handle_callback(update)
+            return
+
+        message = update.effective_message
+        chat = update.effective_chat
+        user = update.effective_user
+
+        if not message or not chat or not user:
+            return
+
+        # panel & commands sirf private chat me
+        if chat.type != "private":
+            return
+
+        text = (message.text or "").strip()
+
+        if text.startswith("/start"):
+            bot.send_message(
+                chat_id=chat.id,
+                text=(
+                    "Namaste! 👋\n\n"
+                    "Main <b>Ayush Global News Bot</b> hoon.\n"
+                    "Har 15 minute me channel par latest international news bhejta hoon.\n\n"
+                    "Agar aap admin ho to /panel likh kar control panel open kar sakte hain."
+                ),
+                parse_mode="HTML",
+            )
+
+        elif text.startswith("/panel"):
+            if not is_admin(user.id):
+                bot.send_message(
+                    chat_id=chat.id,
+                    text="❌ Ye control sirf admins ke liye hai.",
+                )
+                return
+            send_control_panel(chat.id)
+
+        elif text.startswith("/status"):
+            if not is_admin(user.id):
+                bot.send_message(
+                    chat_id=chat.id,
+                    text="❌ Ye command sirf admins ke liye hai.",
+                )
+                return
+            bot.send_message(
+                chat_id=chat.id,
+                text=build_status_text(),
+                parse_mode="HTML",
+            )
+
+        elif text.startswith("/news1"):
+            if not is_admin(user.id):
+                bot.send_message(
+                    chat_id=chat.id,
+                    text="❌ Ye command sirf admins ke liye hai.",
+                )
+                return
+            bot.send_message(chat_id=chat.id, text="📰 1 news channel par bhej raha hoon...")
+            post_news(force=True, max_items=1)
+
+        elif text.startswith("/enable"):
+            if not is_admin(user.id):
+                bot.send_message(chat_id=chat.id, text="❌ Only admins allowed.")
+                return
+            global AUTO_NEWS_ENABLED
+            AUTO_NEWS_ENABLED = True
+            bot.send_message(chat_id=chat.id, text="▶️ Auto news <b>ON</b> ho gaya.", parse_mode="HTML")
+
+        elif text.startswith("/disable"):
+            if not is_admin(user.id):
+                bot.send_message(chat_id=chat.id, text="❌ Only admins allowed.")
+                return
+            AUTO_NEWS_ENABLED = False
+            bot.send_message(chat_id=chat.id, text="⏸ Auto news <b>OFF</b> ho gaya.", parse_mode="HTML")
+
     except Exception as e:
-        logging.error(f"Poll send failed: {e}")
-        send_admin_alert(f"Poll failed: {e}")
+        logging.error(f"handle_update error: {e}")
 
 
-# ============= STATUS TEXT FOR /status =============
+def handle_callback(update: Update):
+    query = update.callback_query
+    user = query.from_user
+    chat_id = query.message.chat.id
 
-def build_status_text() -> str:
-    ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    now_str = ist_now.strftime("%d %b %Y | %I:%M %p IST")
+    if not is_admin(user.id):
+        query.answer("Not allowed ❌", show_alert=True)
+        return
 
-    if last_run_time:
-        ist_last = last_run_time + timedelta(hours=5, minutes=30)
-        last_str = ist_last.strftime("%d %b %Y | %I:%M %p IST")
+    data = query.data or ""
+
+    if data == "panel_status":
+        query.answer("Status bhej raha hoon…")
+        bot.send_message(
+            chat_id=chat_id, text=build_status_text(), parse_mode="HTML"
+        )
+
+    elif data == "panel_news1":
+        query.answer("1 news channel par…")
+        post_news(force=True, max_items=1)
+
+    elif data == "panel_toggle":
+        global AUTO_NEWS_ENABLED
+        AUTO_NEWS_ENABLED = not AUTO_NEWS_ENABLED
+        state = "ON ✅" if AUTO_NEWS_ENABLED else "OFF ⏸"
+        query.answer(f"Auto news {state}")
+        bot.send_message(chat_id=chat_id, text=f"Auto news ab {state} hai.")
+
+    elif data == "panel_refresh":
+        sent_ids.clear()
+        query.answer("Cache clear ✅")
+        bot.send_message(chat_id=chat_id, text="News cache reset ho gaya.")
+
+    elif data == "panel_test":
+        query.answer("Test message ✅")
+        send_demo_update(chat_id)
+
     else:
-        last_str = "N/A"
-
-    text = (
-        "<b>Ayush Turbo News Bot Status</b>\n\n"
-        f"🕒 Current time (IST): <i>{now_str}</i>\n"
-        f"✅ Last news run: <i>{last_str}</i>\n"
-        f"📰 Last run posted: <b>{last_run_count}</b> articles\n"
-        f"🛡 Safe mode: <b>{'ON' if SAFE_MODE else 'OFF'}</b>\n"
-        f"🧠 AI summary: <b>{'ON' if OPENAI_API_KEY else 'OFF'}</b>\n"
-        f"📦 Stored posts for summary: <b>{len(recent_posts)}</b>\n"
-    )
-    return text
+        query.answer("Unknown action")
 
 
-# ============= SCHEDULER =============
-
+# ------------ SCHEDULER LOOP ------------
 def scheduler_loop():
     while True:
         schedule.run_pending()
         time.sleep(1)
 
 
-@app.route("/")
-def home():
-    return "Ayush Turbo News Bot Running!", 200
-
-
-# ============= TELEGRAM WEBHOOK FOR /status =============
-
-@app.route("/webhook", methods=["POST"])
-def telegram_webhook():
-    try:
-        data = request.get_json(force=True)
-    except Exception:
-        return "ok"
-
-    message = data.get("message") or data.get("edited_message")
-    if not message:
-        return "ok"
-
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
-    chat_type = chat.get("type")
-    text = message.get("text", "")
-
-    # Sirf private chat me /status ka reply
-    if chat_type == "private" and text.startswith("/status"):
-        status_text = build_status_text()
+# ------------ FLASK ROUTES (WEBHOOK + HOME) ------------
+@app.route("/", methods=["GET", "POST"])
+def webhook():
+    if flask_request.method == "POST":
         try:
-            bot.send_message(
-                chat_id=chat_id,
-                text=status_text,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
+            update = Update.de_json(flask_request.get_json(force=True), bot)
+            handle_update(update)
         except Exception as e:
-            logging.error(f"Failed to send /status response: {e}")
-
-    return "ok"
-
-
-def send_demo_message():
-    ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    time_str = ist.strftime("%d %b %Y | %I:%M %p IST")
-
-    text = (
-        "🟢 <b>Ayush Turbo News Bot Updated</b>\n"
-        f"🗓 <i>{time_str}</i>\n\n"
-        "Bot safaltapoorvak chal raha hai.\n"
-        "Ab se India + World news, images, categories, hashtags, polls & summaries "
-        "sab automatic milenge.\n\n"
-        "#Update #LiveBot\n"
-        "Powered by @Axshchxhan"
-    )
-
-    bot.send_message(
-        chat_id=TELEGRAM_CHANNEL_ID,
-        text=text,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-
-
-def main():
-    logging.info("🔥 Ayush Turbo News Bot Started!")
-
-    # News schedule
-    if SAFE_MODE:
-        schedule.every(30).minutes.do(post_news)
+            logging.error(f"Webhook error: {e}")
+        return "ok"
     else:
-        schedule.every(15).minutes.do(post_news)
+        return "Ayush Telegram News Bot Running!", 200
 
-    # Morning & Night summaries (UTC times approx for IST)
-    schedule.every().day.at("02:30").do(morning_summary)  # ~08:00 IST
-    schedule.every().day.at("16:00").do(night_summary)   # ~21:30 IST
 
-    # Daily engagement poll (~20:30 IST)
-    schedule.every().day.at("15:00").do(daily_poll)
+# ------------ MAIN ------------
+def main():
+    logging.info("🔥 Ayush Telegram News Bot Started!")
 
-    # Startup demo
+    # 15 minute schedule
+    schedule.every(15).minutes.do(post_news)
+
+    # ek baar demo update channel par
     try:
-        send_demo_message()
+        send_demo_update(TELEGRAM_CHANNEL_ID)
     except Exception as e:
-        logging.error(f"Demo message error: {e}")
-        send_admin_alert(f"Demo message error: {e}")
+        logging.error(f"Demo update send error: {e}")
 
-    # First immediate news run
-    try:
-        post_news()
-    except Exception as e:
-        logging.error(f"First run post_news error: {e}")
-        send_admin_alert(f"First run error: {e}")
-
+    # scheduler background thread
     t = Thread(target=scheduler_loop, daemon=True)
     t.start()
 
