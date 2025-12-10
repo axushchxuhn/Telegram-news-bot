@@ -3,49 +3,42 @@ import time
 import json
 import html
 import logging
+import tempfile
 from datetime import datetime, timedelta
 from threading import Thread
 
 import feedparser
+import schedule
 import requests
 from flask import Flask, request as flask_request
-from telegram import Bot, ParseMode, ReplyKeyboardMarkup
-from telegram.utils.request import Request as TgRequest
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.utils.request import Request
 
-
-# ========== CONFIG FROM ENV ==========
-
+# ------------- ENVIRONMENT CONFIG -------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")  # "-100...."
-ADMIN_USER_IDS_RAW = os.getenv("ADMIN_USER_IDS", "")
-OWNER_ID = os.getenv("OWNER_ID", "").strip() or None
-
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")  # like "-1001234567890"
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # your user id
+ADMIN_USER_IDS = os.getenv("ADMIN_USER_IDS", "")  # "123,456"
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-DEEPSEEK_BASE = os.getenv("DEEPSEEK_BASE", "https://api.deepseek.com")
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-
-SELF_PING_URL = os.getenv("SELF_PING_URL", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+SELF_PING_URL = os.getenv("SELF_PING_URL", "")
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHANNEL_ID:
-    raise RuntimeError(
-        "Missing environment variables! TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID set karo."
-    )
+    raise RuntimeError("Missing env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID")
 
-ADMIN_USER_IDS = set()
-for part in ADMIN_USER_IDS_RAW.split(","):
-    part = part.strip()
-    if part.isdigit():
-        ADMIN_USER_IDS.add(int(part))
+ADMIN_IDS = set()
+if OWNER_ID:
+    ADMIN_IDS.add(OWNER_ID)
+if ADMIN_USER_IDS.strip():
+    for x in ADMIN_USER_IDS.replace(" ", "").split(","):
+        if x.isdigit():
+            ADMIN_IDS.add(int(x))
 
-if OWNER_ID and OWNER_ID.isdigit():
-    ADMIN_USER_IDS.add(int(OWNER_ID))
-
-CONTROL_CHAT_ID = int(OWNER_ID) if OWNER_ID and OWNER_ID.isdigit() else None
-
-
-# ========== GLOBAL SETTINGS ==========
+# ====== GLOBAL SETTINGS ======
+NEWS_INTERVAL_MINUTES = 30   # har 30 minute me cycle
+NEWS_PER_RUN = 5             # har cycle max 5 news
 
 RSS_LINKS = [
     "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en",
@@ -53,47 +46,37 @@ RSS_LINKS = [
     "https://feeds.bbci.co.uk/news/world/rss.xml",
 ]
 
-NEWS_PER_RUN = 5
-NEWS_INTERVAL_MINUTES = 30  # tumhari demand ke hisaab se
-POSTING_PAUSED = False
-
-sent_ids = set()          # duplicate filter
-recent_news = []          # last 100 news for briefs
-
-last_news_run_ts = 0
-last_morning_brief_date = None
-last_night_brief_date = None
-
-campaign_enabled = False
-campaign_text = ""  # ex: "Crypto ke liye @XYZ join karein"
-
-ai_error_streak = 0
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-tg_request = TgRequest(con_pool_size=8)
-bot = Bot(token=TELEGRAM_BOT_TOKEN, request=tg_request)
+request = Request(con_pool_size=8)
+bot = Bot(token=TELEGRAM_BOT_TOKEN, request=request)
 
 app = Flask(__name__)
 
+sent_ids = set()
+POSTING_PAUSED = False
+last_news_run_ts = 0
+last_morning_brief_date = None
+last_night_brief_date = None
 
-# ========== SMALL UTILS ==========
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
 
 def ist_now():
-    """Current time in IST."""
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
 
 def short_url(url: str) -> str:
-    """TinyURL shortener, safe fallback to original."""
     try:
         r = requests.get(
             "https://tinyurl.com/api-create.php",
             params={"url": url},
-            timeout=10
+            timeout=8,
         )
         if r.status_code == 200:
             return r.text.strip()
@@ -102,536 +85,355 @@ def short_url(url: str) -> str:
     return url
 
 
-def add_recent_news(entry):
-    """Store limited history for briefs."""
-    global recent_news
-    recent_news.append(entry)
-    if len(recent_news) > 100:
-        recent_news = recent_news[-100:]
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_USER_IDS
-
-
-# ========== AI SUMMARY (HINDI FIRST) ==========
-
-def build_ai_prompt(title, description, link, mode="normal"):
-    base = f"Title: {title}\n\nDescription: {description}\n\nLink: {link}\n"
-
-    if mode == "normal":
-        extra = """
-Tum ek professional Hindi news anchor ho.
-
-Sirf yeh JSON return karo (JSON ke bahar kuch mat likho):
-
-{
-  "summary_hi": "2-3 chhoti, seedhi Hindi lines jo news samjhayen.",
-  "hashtags": "#WorldNews #Breaking #Update"
-}
-
-Rules:
-- summary_hi bilkul natural Hindi ho, TV news anchor jaise.
-- Koi emoji nahi summary me.
-- hashtags me 3-4 relevant tags, ek hi line me (space se separated).
-"""
-    elif mode == "morning":
-        extra = """
-Tum Hindi news anchor ho.
-
-Subah ke liye ek chhota sa bulletin banaao.
-Sirf yeh JSON return karo:
-
-{
-  "summary_hi": "4-5 short Hindi lines - raat bhar ki sabse badi world headlines.",
-  "hashtags": "#MorningBrief #WorldNews"
-}
-"""
-    else:  # night
-        extra = """
-Tum Hindi news anchor ho.
-
-Raat ke liye ek chhota sa bulletin banaao.
-Sirf yeh JSON return karo:
-
-{
-  "summary_hi": "4-5 short Hindi lines - poore din ki sabse important world headlines.",
-  "hashtags": "#NightBrief #WorldNews"
-}
-"""
-    return base + extra
-
-
-def ai_call_deepseek(prompt):
-    global ai_error_streak
-
-    if not DEEPSEEK_API_KEY:
-        return None
-
-    try:
-        payload = {
-            "model": DEEPSEEK_MODEL,
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.4,
-            "max_tokens": 300,
-        }
-        r = requests.post(
-            f"{DEEPSEEK_BASE}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=25,
-        )
-        data = r.json()
-        content = data["choices"][0]["message"]["content"]
-        obj = json.loads(content)
-        ai_error_streak = 0
-        return obj
-    except Exception as e:
-        logging.error(f"Deepseek error: {e}")
-        ai_error_streak += 1
-        return None
-
-
-def ai_call_openai(prompt):
-    global ai_error_streak
-
-    if not OPENAI_API_KEY:
-        return None
-
-    try:
-        payload = {
-            "model": "gpt-4.1-mini",
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.4,
-            "max_tokens": 300,
-        }
-        r = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=25,
-        )
-        data = r.json()
-        content = data["choices"][0]["message"]["content"]
-        obj = json.loads(content)
-        ai_error_streak = 0
-        return obj
-    except Exception as e:
-        logging.error(f"OpenAI error: {e}")
-        ai_error_streak += 1
-        return None
-
-
-def ai_summarize(title, description, link, mode="normal"):
+def ai_summarize_hi(title: str, description: str, link: str) -> str:
     """
-    Returns: (summary_hi, hashtags)
-    hamesha kuch na kuch return karega (fallback bhi hai).
+    Short Hindi summary. Pehle DeepSeek / OpenAI use karega,
+    agar key na ho toh simple fallback.
     """
-    global ai_error_streak
+    base_text = f"{title}\n\n{description}\n\nLink: {link}"
 
-    text = description or title or ""
-    text = text[:700]
+    # ---- DeepSeek ----
+    if DEEPSEEK_API_KEY:
+        try:
+            payload = {
+                "model": DEEPSEEK_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Tum ek professional Hindi news editor ho. "
+                            "Har baar 3-4 chhoti simple lines me Hindi me summary do. "
+                            "Koi role ya explanation mat do."
+                        ),
+                    },
+                    {"role": "user", "content": base_text},
+                ],
+                "max_tokens": 220,
+                "temperature": 0.7,
+            }
+            r = requests.post(
+                f"{DEEPSEEK_BASE_URL}/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=25,
+            )
+            data = r.json()
+            return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            logging.error(f"DeepSeek error: {e}")
 
-    prompt = build_ai_prompt(title, text, link, mode=mode)
+    # ---- OpenAI (optional backup) ----
+    if OPENAI_API_KEY:
+        try:
+            payload = {
+                "model": "gpt-4.1-mini",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Tum ek professional Hindi news editor ho. "
+                            "Har baar 3-4 chhoti simple lines me Hindi me summary do. "
+                            "Koi role ya explanation mat do."
+                        ),
+                    },
+                    {"role": "user", "content": base_text},
+                ],
+                "max_tokens": 220,
+                "temperature": 0.7,
+            }
+            r = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=25,
+            )
+            data = r.json()
+            return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            logging.error(f"OpenAI error: {e}")
 
-    obj = ai_call_deepseek(prompt)
-    if obj is None:
-        obj = ai_call_openai(prompt)
-
-    if obj is not None:
-        summary_hi = obj.get("summary_hi", "").strip()
-        hashtags = obj.get("hashtags", "#WorldNews #Update").strip()
-        if summary_hi:
-            return summary_hi, hashtags
-
-    # ---- Fallback: simple Hindi summary (no AI needed) ----
-    ai_error_streak += 1
-    summary_hi = f"{title}\n\n{text[:200]}..."
-    hashtags = "#WorldNews #Update"
-    return summary_hi, hashtags
+    # ---- simple fallback (no AI) ----
+    if description:
+        return f"{title}\n\n{description[:260]}..."
+    return title
 
 
-# ========== FETCH LATEST NEWS ==========
+def fetch_image(url: str) -> str | None:
+    """
+    Page se og:image nikalne ki koshish karega.
+    Sirf image URL return karega.
+    """
+    try:
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            return None
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        og = soup.find("meta", property="og:image") or soup.find(
+            "meta", attrs={"name": "og:image"}
+        )
+        if og and og.get("content"):
+            return og["content"]
+    except Exception:
+        return None
+    return None
+
 
 def fetch_news():
     entries = []
     for url in RSS_LINKS:
         try:
             feed = feedparser.parse(url)
-            for e in feed.entries[:6]:
+            for e in feed.entries[:10]:
                 eid = getattr(e, "id", None) or getattr(e, "link", None)
-                if not eid:
+                if not eid or eid in sent_ids:
                     continue
-                entries.append({
-                    "id": eid,
-                    "title": getattr(e, "title", ""),
-                    "link": getattr(e, "link", ""),
-                    "summary": getattr(e, "summary", "") or getattr(e, "description", ""),
-                    "image": extract_image(e),
-                })
-        except Exception as e:
-            logging.error(f"RSS error from {url}: {e}")
-    # latest last
+                entries.append(
+                    {
+                        "id": eid,
+                        "title": getattr(e, "title", ""),
+                        "link": getattr(e, "link", ""),
+                        "summary": getattr(e, "summary", "")
+                        or getattr(e, "description", ""),
+                    }
+                )
+        except Exception as ex:
+            logging.error(f"RSS error: {ex}")
+
+    # newest last -> first
     return entries[::-1]
 
 
-def extract_image(entry):
-    """RSS se image nikaalne ki attempt."""
-    try:
-        if hasattr(entry, "media_content") and entry.media_content:
-            return entry.media_content[0].get("url")
-        if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
-            return entry.media_thumbnail[0].get("url")
-    except Exception:
-        pass
-    return None
-
-
-# ========== MESSAGE FORMAT ==========
-
-def format_message(title, summary_hi, link, hashtags):
+def format_news_message(title: str, summary_hi: str, link: str) -> str:
     safe_title = html.escape(title)
     safe_summary = html.escape(summary_hi)
-    safe_tags = html.escape(hashtags)
-
+    short = short_url(link)
     ist = ist_now()
     time_str = ist.strftime("%d %b %Y | %I:%M %p IST")
 
-    short = short_url(link)
-
-    parts = [
-        f"📰 <b>{safe_title}</b>",
-        f"🕒 <i>{time_str}</i>",
-        "",
-        safe_summary,
-        "",
-        f"🔗 <b>Full Story:</b> <a href=\"{short}\">Read here</a>",
-    ]
-
-    if campaign_enabled and campaign_text:
-        parts.append("")
-        parts.append(html.escape(campaign_text))
-
-    parts.append("")
-    parts.append(safe_tags)
-    parts.append("Powered by @Axshchxhan")
-
-    return "\n".join(parts)
+    msg = (
+        f"🧭 <b>GlobalUpdates • Breaking News</b>\n"
+        f"🕒 <i>{time_str}</i>\n\n"
+        f"📰 <b>{safe_title}</b>\n\n"
+        f"{safe_summary}\n\n"
+        f"🔗 <a href=\"{short}\">Full Story</a>\n\n"
+        f"#WorldNews #Breaking #Update\n"
+        f"<i>Powered by @Axshchxhan</i>"
+    )
+    return msg
 
 
-# ========== MAIN NEWS POSTING ==========
+def post_single_news(item: dict):
+    title = item["title"]
+    link = item["link"]
+    desc = item["summary"]
+
+    summary_hi = ai_summarize_hi(title, desc, link)
+    msg_text = format_news_message(title, summary_hi, link)
+
+    image_url = fetch_image(link)
+
+    if image_url:
+        try:
+            bot.send_photo(
+                chat_id=TELEGRAM_CHANNEL_ID,
+                photo=image_url,
+                caption=msg_text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception as e:
+            logging.error(f"send_photo error: {e}")
+
+    bot.send_message(
+        chat_id=TELEGRAM_CHANNEL_ID,
+        text=msg_text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
 
 def post_news():
-    global sent_ids
-
+    global last_news_run_ts
     if POSTING_PAUSED:
-        logging.info("Posting paused, skipping this run.")
+        logging.info("Posting paused, skipping news cycle.")
         return
 
     logging.info("Checking for new news...")
     entries = fetch_news()
-
     count = 0
     for e in entries:
         if count >= NEWS_PER_RUN:
             break
-
         if e["id"] in sent_ids:
             continue
-
-        title = e["title"]
-        link = e["link"]
-        desc = e["summary"]
-
-        summary_hi, hashtags = ai_summarize(title, desc, link, mode="normal")
-        msg_text = format_message(title, summary_hi, link, hashtags)
-
         try:
-            if e["image"]:
-                bot.send_photo(
-                    chat_id=TELEGRAM_CHANNEL_ID,
-                    photo=e["image"],
-                    caption=msg_text,
-                    parse_mode=ParseMode.HTML
-                )
-            else:
-                bot.send_message(
-                    chat_id=TELEGRAM_CHANNEL_ID,
-                    text=msg_text,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-            logging.info(f"Sent news: {title}")
+            post_single_news(e)
+            sent_ids.add(e["id"])
+            count += 1
+            time.sleep(2)
         except Exception as ex:
-            logging.error(f"Send error: {ex}")
-            # even if send fail, mark as sent to avoid spam
-        sent_ids.add(e["id"])
-        add_recent_news(e)
-        count += 1
-        time.sleep(2)
+            logging.error(f"post_single_news error: {ex}")
+
+    last_news_run_ts = time.time()
+    logging.info(f"Posted {count} items this run.")
 
 
-# ========== MORNING / NIGHT BRIEFS ==========
-
-def make_brief(mode: str):
-    """mode = 'morning' or 'night'."""
-    if not recent_news:
-        return None, None
-
-    # last 15 items maximum
-    selected = recent_news[-15:]
-    titles = [n["title"] for n in selected if n.get("title")]
-    joined = "\n".join(f"- {t}" for t in titles[:15])
-
-    dummy_link = "https://news.google.com/"
-
-    summary_hi, hashtags = ai_summarize(
-        title="Brief",
-        description=joined,
-        link=dummy_link,
-        mode=mode,
-    )
-
-    ist = ist_now()
-    title = "🌅 Morning Brief" if mode == "morning" else "🌙 Night Brief"
-
-    safe_summary = html.escape(summary_hi)
-    safe_tags = html.escape(hashtags)
-    time_str = ist.strftime("%d %b %Y | %I:%M %p IST")
-
-    parts = [
-        f"{title}",
-        f"🕒 <i>{time_str}</i>",
-        "",
-        safe_summary,
-        "",
-        safe_tags,
-        "Powered by @Axshchxhan",
+def build_admin_keyboard():
+    btns = [
+        [InlineKeyboardButton("🔄 Status", callback_data="adm_status")],
+        [
+            InlineKeyboardButton("⏸ Pause", callback_data="adm_pause"),
+            InlineKeyboardButton("▶ Resume", callback_data="adm_resume"),
+        ],
+        [InlineKeyboardButton("⏱ Interval", callback_data="adm_interval")],
+        [InlineKeyboardButton("❓ Help", callback_data="adm_help")],
     ]
-    return "\n".join(parts), None
-
-
-def send_brief(mode: str):
-    msg, _ = make_brief(mode)
-    if not msg:
-        return
-    try:
-        bot.send_message(
-            chat_id=TELEGRAM_CHANNEL_ID,
-            text=msg,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        logging.info(f"Sent {mode} brief.")
-    except Exception as e:
-        logging.error(f"Brief send error: {e}")
-
-
-# ========== ADMIN PANEL (DM ONLY) ==========
-
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        ["📊 Status", "⏱ Interval"],
-        ["▶ Resume", "⏸ Pause"],
-        ["📰 Test news", "📣 Campaign"],
-        ["⚙ Sources", "❌ Close keyboard"],
-    ],
-    resize_keyboard=True,
-    one_time_keyboard=False
-)
-
-
-def send_admin(msg: str):
-    if CONTROL_CHAT_ID:
-        try:
-            bot.send_message(chat_id=CONTROL_CHAT_ID, text=msg)
-        except Exception as e:
-            logging.error(f"Failed to send admin DM: {e}")
-
-
-def handle_admin_text(chat_id: int, user_id: int, text: str):
-    global POSTING_PAUSED, NEWS_INTERVAL_MINUTES, campaign_enabled, campaign_text, ai_error_streak
-
+    return InlineKeyboardMarkup(btns)
+    def handle_admin_command_text(chat_id: int, user_id: int, text: str):
+    """
+    Plain text admin control (slash ki zarurat nahi).
+    Example: 'status', 'pause', 'resume', 'interval 30'
+    """
     t = text.strip().lower()
 
-    if t in ("menu", "/menu", "help", "/start"):
+    if t in ("status", "bot status", "info"):
+        status = "⏸ Paused" if POSTING_PAUSED else "▶ Active"
+        ist = ist_now().strftime("%d %b %Y | %I:%M %p IST")
+        msg = (
+            f"🧭 <b>GlobalUpdates • Control Panel</b>\n"
+            f"Status: {status}\n"
+            f"Interval: {NEWS_INTERVAL_MINUTES} min\n"
+            f"Last run: {time.ctime(last_news_run_ts) if last_news_run_ts else 'Not yet'}\n"
+            f"Time (IST): {ist}"
+        )
         bot.send_message(
             chat_id=chat_id,
-            text=(
-                "Ayush News Bot Admin Panel\n\n"
-                "Commands (without /):\n"
-                "- status\n- pause / resume\n"
-                "- interval 15 / interval 30\n"
-                "- test news\n"
-                "- campaign on <text>\n- campaign off\n"
-                "- sources (sirf info ke liye, abhi manual list)\n"
-            ),
-            reply_markup=MAIN_KEYBOARD
+            text=msg,
+            parse_mode="HTML",
+            reply_markup=build_admin_keyboard(),
         )
         return
 
-    if "status" in t or t.startswith("📊"):
-        ist = ist_now()
-        txt = (
-            f"🟢 Bot status:\n"
-            f"- Time IST: {ist.strftime('%d %b %Y | %I:%M %p')}\n"
-            f"- Interval: {NEWS_INTERVAL_MINUTES} min\n"
-            f"- Paused: {'Yes' if POSTING_PAUSED else 'No'}\n"
-            f"- Sent IDs: {len(sent_ids)}\n"
-            f"- Recent news stored: {len(recent_news)}\n"
-            f"- AI error streak: {ai_error_streak}\n"
-        )
-        bot.send_message(chat_id=chat_id, text=txt)
-        return
-
-    if t.startswith("pause") or t.startswith("⏸"):
+    if t in ("pause", "stop"):
+        global POSTING_PAUSED
         POSTING_PAUSED = True
-        bot.send_message(chat_id=chat_id, text="⏸ Posting paused.")
+        bot.send_message(
+            chat_id=chat_id,
+            text="⏸ News posting ab <b>PAUSE</b> ho gaya.",
+            parse_mode="HTML",
+            reply_markup=build_admin_keyboard(),
+        )
         return
 
-    if t.startswith("resume") or t.startswith("▶"):
+    if t in ("resume", "start"):
+        global POSTING_PAUSED
         POSTING_PAUSED = False
-        bot.send_message(chat_id=chat_id, text="▶ Posting resumed.")
+        bot.send_message(
+            chat_id=chat_id,
+            text="▶ News posting <b>RESUME</b> ho gaya.",
+            parse_mode="HTML",
+            reply_markup=build_admin_keyboard(),
+        )
         return
 
     if t.startswith("interval"):
-        # example: "interval 15"
         parts = t.split()
-        if len(parts) == 2 and parts[1].isdigit():
-            minutes = int(parts[1])
-            if 5 <= minutes <= 180:
-                NEWS_INTERVAL_MINUTES = minutes
-                bot.send_message(
-                    chat_id=chat_id,
-                    text=f"⏱ Interval set to {minutes} minutes."
-                )
-            else:
-                bot.send_message(
-                    chat_id=chat_id,
-                    text="Interval 5 se 180 minute ke beech hona chahiye."
-                )
-        else:
-            bot.send_message(chat_id=chat_id, text="Use: interval 15  (ya 30, 45, ...)")
-        return
-
-    if t.startswith("⏱"):
-        bot.send_message(chat_id=chat_id, text="Example:  interval 30")
-        return
-
-    if t.startswith("test news") or t.startswith("📰"):
-        entries = fetch_news()
-        if not entries:
-            bot.send_message(chat_id=chat_id, text="Koi news nahi mili abhi.")
-            return
-        e = entries[-1]
-        summary_hi, hashtags = ai_summarize(e["title"], e["summary"], e["link"])
-        msg_text = format_message(e["title"], summary_hi, e["link"], hashtags)
-        try:
-            if e["image"]:
-                bot.send_photo(
-                    chat_id=chat_id,
-                    photo=e["image"],
-                    caption=msg_text,
-                    parse_mode=ParseMode.HTML
-                )
-            else:
-                bot.send_message(
-                    chat_id=chat_id,
-                    text=msg_text,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-        except Exception as ex:
-            logging.error(f"Admin test send error: {ex}")
-        return
-
-    if t.startswith("campaign on"):
-        rest = text[len("campaign on"):].strip()
-        if not rest:
+        if len(parts) >= 2 and parts[1].isdigit():
+            global NEWS_INTERVAL_MINUTES
+            NEWS_INTERVAL_MINUTES = max(5, int(parts[1]))
             bot.send_message(
                 chat_id=chat_id,
-                text="Usage: campaign on  Text jo har post ke niche jaye."
+                text=f"⏱ Interval ab <b>{NEWS_INTERVAL_MINUTES} minutes</b> ho gaya.",
+                parse_mode="HTML",
+                reply_markup=build_admin_keyboard(),
             )
-            return
-        campaign_enabled = True
-        campaign_text = rest
-        bot.send_message(
-            chat_id=chat_id,
-            text=f"📣 Campaign ON:\n{campaign_text}"
-        )
+        else:
+            bot.send_message(
+                chat_id=chat_id,
+                text="Use: <code>interval 30</code>",
+                parse_mode="HTML",
+                reply_markup=build_admin_keyboard(),
+            )
         return
 
-    if t.startswith("campaign off") or t.startswith("📣"):
-        campaign_enabled = False
-        campaign_text = ""
-        bot.send_message(chat_id=chat_id, text="📣 Campaign OFF.")
-        return
-
-    if t.startswith("sources") or t.startswith("⚙"):
-        txt = "Current RSS sources:\n" + "\n".join(f"- {u}" for u in RSS_LINKS)
-        bot.send_message(chat_id=chat_id, text=txt)
-        return
-
-    if "close keyboard" in t or "❌" in t:
-        bot.send_message(
-            chat_id=chat_id,
-            text="Keyboard closed.",
-            reply_markup=ReplyKeyboardMarkup([["/menu"]], resize_keyboard=True)
-        )
-        return
-
-    # unknown admin command
-    bot.send_message(chat_id=chat_id, text="Unknown admin command. 'menu' likho help ke liye.")
+    # default help
+    help_text = (
+        "🧭 <b>GlobalUpdates • Admin Commands</b>\n\n"
+        "Bas normal text me likho (slash ki jarurat nahi):\n"
+        "- <b>status</b> → bot ka status\n"
+        "- <b>pause</b> → news band\n"
+        "- <b>resume</b> → news chalu\n"
+        "- <b>interval 30</b> → har 30 min me news\n"
+    )
+    bot.send_message(
+        chat_id=chat_id,
+        text=help_text,
+        parse_mode="HTML",
+        reply_markup=build_admin_keyboard(),
+    )
 
 
 def handle_update(update: dict):
-    """Webhook se aane wale saare Telegram updates ko yahan process karo."""
-    message = update.get("message") or update.get("edited_message")
-    if not message:
-        return
+    """
+    Webhook se aane wale saare updates yahan handle honge.
+    Sirf admin / owner ke DM ke liye.
+    """
+    if "message" in update:
+        msg = update["message"]
+        chat_id = msg["chat"]["id"]
+        user_id = msg["from"]["id"]
+        text = msg.get("text", "")
 
-    chat = message.get("chat", {})
-    chat_type = chat.get("type")
-    chat_id = chat.get("id")
-    from_user = message.get("from", {})
-    user_id = from_user.get("id")
-    text = message.get("text", "") or ""
+        if not is_admin(int(user_id)):
+            # non-admin ko simple reply
+            try:
+                bot.send_message(
+                    chat_id=chat_id,
+                    text="Ye private control bot hai. Sirf owner ke liye available hai.",
+                )
+            except Exception:
+                pass
+            return
 
-    # sirf private chat handle, channel/group ignore
-    if chat_type != "private" or not text:
-        return
+        handle_admin_command_text(
+            chat_id=int(chat_id),
+            user_id=int(user_id),
+            text=text,
+        )
 
-    if not user_id:
-        return
+    elif "callback_query" in update:
+        cq = update["callback_query"]
+        data = cq.get("data", "")
+        chat_id = cq["message"]["chat"]["id"]
+        user_id = cq["from"]["id"]
 
-    if not is_admin(int(user_id)):
-        # Non-admin ko simple reply
-        try:
-            bot.send_message(
-                chat_id=chat_id,
-                text="Ye private control bot hai. Sirf owner ke liye available hai."
+        if not is_admin(int(user_id)):
+            return
+
+        if data == "adm_status":
+            handle_admin_command_text(chat_id, user_id, "status")
+        elif data == "adm_pause":
+            handle_admin_command_text(chat_id, user_id, "pause")
+        elif data == "adm_resume":
+            handle_admin_command_text(chat_id, user_id, "resume")
+        elif data == "adm_interval":
+            handle_admin_command_text(
+                chat_id, user_id, f"interval {NEWS_INTERVAL_MINUTES}"
             )
-        except Exception:
-            pass
-        return
-
-    handle_admin_text(chat_id=int(chat_id), user_id=int(user_id), text=text)
+        elif data == "adm_help":
+            handle_admin_command_text(chat_id, user_id, "help")
 
 
 # ========== FLASK ROUTES (WEBHOOK + HEALTH) ==========
-
 @app.route("/", methods=["GET", "POST"])
 def index():
     if flask_request.method == "POST":
@@ -647,7 +449,6 @@ def index():
 
 
 # ========== SCHEDULER LOOP ==========
-
 def scheduler_loop():
     global last_news_run_ts, last_morning_brief_date, last_night_brief_date
 
@@ -664,24 +465,6 @@ def scheduler_loop():
                     logging.error(f"post_news error: {e}")
                 last_news_run_ts = now_ts
 
-        # morning brief ~09:00 IST
-        if now_ist.hour == 9:
-            if last_morning_brief_date != now_ist.date():
-                try:
-                    send_brief("morning")
-                except Exception as e:
-                    logging.error(f"Morning brief error: {e}")
-                last_morning_brief_date = now_ist.date()
-
-        # night brief ~22:00 IST
-        if now_ist.hour == 22:
-            if last_night_brief_date != now_ist.date():
-                try:
-                    send_brief("night")
-                except Exception as e:
-                    logging.error(f"Night brief error: {e}")
-                last_night_brief_date = now_ist.date()
-
         # self ping for Render
         if SELF_PING_URL:
             try:
@@ -693,12 +476,34 @@ def scheduler_loop():
 
 
 # ========== MAIN ==========
-
 def main():
     logging.info("🔥 Ayush News Bot V2 ULTRA Started!")
 
-    # Startup DM demo - sirf OWNER ko
-    if CONTROL_CHAT_ID:
+    # Startup DM demo -> sirf OWNER ko (channel ko nahi)
+    if OWNER_ID:
         try:
-            ist = ist_now()
-            ms
+            ist = ist_now().strftime("%d %b %Y | %I:%M %p IST")
+            text = (
+                f"🟢 <b>Ayush News Bot Updated</b>\n"
+                f"🗓 <i>{ist}</i>\n\n"
+                "Demo: Bot safaltapurvak chaalu ho chuka hai.\n"
+                f"Ab har {NEWS_INTERVAL_MINUTES} minute me latest "
+                "international news + image milegi.\n\n"
+                "#Update #LiveBot\n"
+                "Powered by @Axshchxhan"
+            )
+            bot.send_message(chat_id=OWNER_ID, text=text, parse_mode="HTML")
+        except Exception as e:
+            logging.error(f"Startup DM error: {e}")
+
+    # scheduler background thread
+    t = Thread(target=scheduler_loop, daemon=True)
+    t.start()
+
+    # Flask webserver for webhook + health
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+
+
+if __name__ == "__main__":
+    main()
